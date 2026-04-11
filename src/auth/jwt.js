@@ -14,4 +14,8 @@ function generateRefreshToken(userId) {
   return `${userId}.${random}`;
 }
 
-module.exports = { sign, verify, generateRefreshToken };
+function verifyAccessToken(token) {
+  return verify(token, process.env.ACCESS_TOKEN_SECRET);
+}
+
+module.exports = { sign, verify, generateRefreshToken, verifyAccessToken };
