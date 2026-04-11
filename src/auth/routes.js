@@ -2,120 +2,74 @@ const express = require('express');
 const router = express.Router();
 const jwt = require('jsonwebtoken');
 const { validateCredentials } = require('./userService');
-const tokenStore = require('./tokenStore');
-const { rateLimiter } = require('./rateLimiter');
+const { tokenStore } = require('./tokenStore');
+const { generateAccessToken, generateRefreshToken } = require('./tokenUtils');
 
-const ACCESS_TOKEN_SECRET = process.env.ACCESS_TOKEN_SECRET || 'access-secret';
-const REFRESH_TOKEN_SECRET = process.env.REFRESH_TOKEN_SECRET || 'refresh-secret';
-const ACCESS_TOKEN_EXPIRY = process.env.ACCESS_TOKEN_EXPIRY || '15m';
-const REFRESH_TOKEN_EXPIRY = process.env.REFRESH_TOKEN_EXPIRY || '7d';
-const MAX_LOGIN_ATTEMPTS = 3;
-
-function generateAccessToken(payload) {
-  return jwt.sign(payload, ACCESS_TOKEN_SECRET, { expiresIn: ACCESS_TOKEN_EXPIRY });
-}
-
-function generateRefreshToken(payload) {
-  return jwt.sign(payload, REFRESH_TOKEN_SECRET, { expiresIn: REFRESH_TOKEN_EXPIRY });
-}
-
-router.post('/login', rateLimiter({ max: MAX_LOGIN_ATTEMPTS, windowMs: 15 * 60 * 1000, keyPrefix: 'login' }), async (req, res) => {
+router.post('/login', async (req, res) => {
   const { username, password } = req.body;
 
   if (!username || !password) {
-    return res.status(400).json({ error: 'Username and password are required.' });
+    return res.status(400).json({ error: 'Username and password are required' });
   }
 
   let user;
   try {
     user = await validateCredentials(username, password);
   } catch (err) {
-    return res.status(500).json({ error: 'Internal server error.' });
+    return res.status(500).json({ error: 'Internal server error' });
   }
 
   if (!user) {
-    return res.status(401).json({ error: 'Invalid credentials.' });
+    return res.status(401).json({ error: 'Invalid credentials' });
   }
 
-  const payload = { sub: user.id, username: user.username, roles: user.roles };
-  const accessToken = generateAccessToken(payload);
-  const refreshToken = generateRefreshToken({ sub: user.id });
+  const accessToken = generateAccessToken(user);
+  const refreshToken = generateRefreshToken(user);
 
-  try {
-    await tokenStore.saveRefreshToken(user.id, refreshToken);
-  } catch (err) {
-    return res.status(500).json({ error: 'Failed to persist session.' });
-  }
+  tokenStore.add(refreshToken, user.id);
 
   return res.status(200).json({ accessToken, refreshToken });
 });
 
-router.post('/refresh', async (req, res) => {
+router.post('/refresh', (req, res) => {
   const { refreshToken } = req.body;
 
   if (!refreshToken) {
-    return res.status(400).json({ error: 'Refresh token is required.' });
+    return res.status(400).json({ error: 'Refresh token is required' });
   }
 
-  let decoded;
+  if (!tokenStore.has(refreshToken)) {
+    return res.status(401).json({ error: 'Invalid or expired refresh token' });
+  }
+
+  let payload;
   try {
-    decoded = jwt.verify(refreshToken, REFRESH_TOKEN_SECRET);
+    payload = jwt.verify(refreshToken, process.env.REFRESH_TOKEN_SECRET);
   } catch (err) {
-    if (err.name === 'TokenExpiredError') {
-      return res.status(401).json({ error: 'Refresh token has expired.' });
-    }
-    return res.status(401).json({ error: 'Invalid refresh token.' });
+    tokenStore.remove(refreshToken);
+    return res.status(401).json({ error: 'Invalid or expired refresh token' });
   }
 
-  let isValid;
-  try {
-    isValid = await tokenStore.validateRefreshToken(decoded.sub, refreshToken);
-  } catch (err) {
-    return res.status(500).json({ error: 'Internal server error.' });
-  }
+  const user = { id: payload.sub, role: payload.role };
+  const accessToken = generateAccessToken(user);
 
-  if (!isValid) {
-    return res.status(401).json({ error: 'Refresh token has been invalidated.' });
-  }
-
-  let user;
-  try {
-    user = await tokenStore.getUserById(decoded.sub);
-  } catch (err) {
-    return res.status(500).json({ error: 'Internal server error.' });
-  }
-
-  if (!user) {
-    return res.status(401).json({ error: 'User not found.' });
-  }
-
-  const payload = { sub: user.id, username: user.username, roles: user.roles };
-  const newAccessToken = generateAccessToken(payload);
-
-  return res.status(200).json({ accessToken: newAccessToken });
+  return res.status(200).json({ accessToken });
 });
 
-router.post('/logout', async (req, res) => {
+router.post('/logout', (req, res) => {
   const { refreshToken } = req.body;
 
   if (!refreshToken) {
-    return res.status(400).json({ error: 'Refresh token is required.' });
+    return res.status(400).json({ error: 'Refresh token is required' });
   }
 
-  let decoded;
-  try {
-    decoded = jwt.verify(refreshToken, REFRESH_TOKEN_SECRET, { ignoreExpiration: true });
-  } catch (err) {
-    return res.status(401).json({ error: 'Invalid refresh token.' });
+  if (!tokenStore.has(refreshToken)) {
+    return res.status(401).json({ error: 'Invalid or expired refresh token' });
   }
 
-  try {
-    await tokenStore.revokeRefreshToken(decoded.sub, refreshToken);
-  } catch (err) {
-    return res.status(500).json({ error: 'Failed to invalidate session.' });
-  }
+  tokenStore.remove(refreshToken);
 
-  return res.status(200).json({ message: 'Logged out successfully.' });
+  return res.status(200).json({ message: 'Logged out successfully' });
 });
 
 module.exports = router;
