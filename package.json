@@ -1,6 +1,7 @@
 {
   "name": "jwt-auth-middleware",
   "version": "1.0.0",
+  "description": "Production-grade JWT authentication middleware with refresh tokens, role-based access control, and rate limiting",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
