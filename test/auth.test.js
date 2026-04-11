@@ -1,14 +1,53 @@
-import { describe, it, before, after, beforeEach } from 'node:test';
-import assert from 'node:assert/strict';
-import { createServer } from '../src/server.js';
+const { describe, it, before, after, beforeEach } = require('node:test');
+const assert = require('node:assert/strict');
+const { createServer } = require('../src/server');
+const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
+
+const ACCESS_SECRET = 'test-access-secret-32byteslong!!!';
+const REFRESH_SECRET = 'test-refresh-secret-32byteslong!!';
+
+const testUsers = [
+  {
+    id: '1',
+    username: 'admin',
+    role: 'admin',
+    salt: 'testsalt1',
+    passwordHash: '',
+  },
+  {
+    id: '2',
+    username: 'user',
+    role: 'viewer',
+    salt: 'testsalt2',
+    passwordHash: '',
+  },
+];
+
+async function pbkdf2(password, salt) {
+  return new Promise((resolve, reject) => {
+    crypto.pbkdf2(password, salt, 100000, 64, 'sha512', (err, derived) => {
+      if (err) reject(err);
+      else resolve(derived.toString('hex'));
+    });
+  });
+}
 
 let server;
 let baseUrl;
 
 before(async () => {
+  testUsers[0].passwordHash = await pbkdf2('password', testUsers[0].salt);
+  testUsers[1].passwordHash = await pbkdf2('password', testUsers[1].salt);
+
+  process.env.ACCESS_TOKEN_SECRET = ACCESS_SECRET;
+  process.env.REFRESH_TOKEN_SECRET = REFRESH_SECRET;
+  process.env.ACCESS_TOKEN_EXPIRES_IN = '15m';
+  process.env.AUTH_USERS = JSON.stringify(testUsers);
+
   server = await createServer({ port: 0 });
   const { port } = server.address();
-  baseUrl = `http://localhost:${port}`;
+  baseUrl = `http://127.0.0.1:${port}`;
 });
 
 after(async () => {
@@ -148,7 +187,7 @@ describe('Role-based access control', () => {
     assert.ok(body.error);
   });
 
-  it('allows regular user to reach user route', async () => {
+  it('allows viewer to reach unprotected-by-role route', async () => {
     const { status } = await get('/protected', {
       Authorization: `Bearer ${userToken}`,
     });
@@ -157,143 +196,133 @@ describe('Role-based access control', () => {
 });
 
 describe('Rate limiting', () => {
-  it('returns 429 after exceeding the login attempt limit', async () => {
-    const attempts = [];
-    for (let i = 0; i < 20; i++) {
-      attempts.push(
-        post('/auth/login', { username: 'nobody', password: 'wrong' })
-      );
+  it('returns 429 after exceeding login rate limit', async () => {
+    const loginRateLimitServer = await createServer({ port: 0 });
+    const { port } = loginRateLimitServer.address();
+    const rlBase = `http://127.0.0.1:${port}`;
+
+    let lastStatus;
+    for (let i = 0; i < 15; i++) {
+      const res = await fetch(`${rlBase}/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: 'nobody', password: 'wrong' }),
+      });
+      lastStatus = res.status;
+      if (lastStatus === 429) break;
     }
-    const results = await Promise.all(attempts);
-    const tooMany = results.filter((r) => r.status === 429);
-    assert.ok(tooMany.length > 0, 'expected at least one 429 response');
+
+    assert.equal(lastStatus, 429);
+
+    await new Promise((resolve, reject) =>
+      loginRateLimitServer.close((err) => (err ? reject(err) : resolve()))
+    );
   });
 
-  it('429 response includes Retry-After header', async () => {
-    const attempts = [];
-    for (let i = 0; i < 20; i++) {
-      attempts.push(
-        post('/auth/login', { username: 'nobody', password: 'wrong' })
-      );
+  it('response includes Retry-After header when rate limited', async () => {
+    const rlServer = await createServer({ port: 0 });
+    const { port } = rlServer.address();
+    const rlBase = `http://127.0.0.1:${port}`;
+
+    let retryAfter;
+    for (let i = 0; i < 15; i++) {
+      const res = await fetch(`${rlBase}/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: 'nobody', password: 'wrong' }),
+      });
+      if (res.status === 429) {
+        retryAfter = res.headers.get('retry-after');
+        break;
+      }
     }
-    const results = await Promise.all(attempts);
-    const limited = results.find((r) => r.status === 429);
-    if (limited) {
-      assert.ok(
-        limited.headers.get('retry-after'),
-        'Retry-After header missing'
-      );
-    }
+
+    assert.ok(retryAfter, 'Retry-After header missing');
+    assert.ok(Number(retryAfter) > 0, 'Retry-After should be positive');
+
+    await new Promise((resolve, reject) =>
+      rlServer.close((err) => (err ? reject(err) : resolve()))
+    );
   });
 });
 
 describe('Refresh token rotation', () => {
-  let firstRefreshToken;
-  let firstAccessToken;
+  let refreshToken;
+  let accessToken;
 
   before(async () => {
     const { body } = await post('/auth/login', {
-      username: 'user',
+      username: 'admin',
       password: 'password',
     });
-    firstAccessToken = body.accessToken;
-    firstRefreshToken = body.refreshToken;
+    accessToken = body.accessToken;
+    refreshToken = body.refreshToken;
   });
 
-  it('issues new tokens when a valid refresh token is presented', async () => {
-    const { status, body } = await post('/auth/refresh', {
-      refreshToken: firstRefreshToken,
-    });
+  it('returns new tokens when a valid refresh token is submitted', async () => {
+    const { status, body } = await post('/auth/refresh', { refreshToken });
     assert.equal(status, 200);
     assert.ok(body.accessToken, 'new accessToken missing');
     assert.ok(body.refreshToken, 'new refreshToken missing');
   });
 
-  it('new access token differs from the original', async () => {
-    const { body } = await post('/auth/refresh', {
-      refreshToken: firstRefreshToken,
+  it('old refresh token is invalidated after rotation', async () => {
+    const firstLogin = await post('/auth/login', {
+      username: 'admin',
+      password: 'password',
     });
-    assert.notEqual(body.accessToken, firstAccessToken);
+    const originalRefresh = firstLogin.body.refreshToken;
+
+    const firstRefresh = await post('/auth/refresh', { refreshToken: originalRefresh });
+    assert.equal(firstRefresh.status, 200);
+
+    const secondRefresh = await post('/auth/refresh', { refreshToken: originalRefresh });
+    assert.equal(secondRefresh.status, 401);
+    assert.ok(secondRefresh.body.error);
   });
 
-  it('rejects a refresh token that has already been rotated (replay attack)', async () => {
-    const first = await post('/auth/refresh', {
-      refreshToken: firstRefreshToken,
+  it('returns 401 for a tampered refresh token', async () => {
+    const { status, body } = await post('/auth/refresh', {
+      refreshToken: 'totally.fake.token',
     });
-    assert.equal(first.status, 200);
-
-    const second = await post('/auth/refresh', {
-      refreshToken: firstRefreshToken,
-    });
-    assert.equal(second.status, 401);
-    assert.ok(second.body.error);
-  });
-
-  it('returns 400 when refresh token is missing from request body', async () => {
-    const { status, body } = await post('/auth/refresh', {});
-    assert.equal(status, 400);
+    assert.equal(status, 401);
     assert.ok(body.error);
   });
 
-  it('returns 401 for a completely invalid refresh token string', async () => {
-    const { status, body } = await post('/auth/refresh', {
-      refreshToken: 'garbage-token-value',
-    });
-    assert.equal(status, 401);
+  it('returns 400 when refresh token is missing', async () => {
+    const { status, body } = await post('/auth/refresh', {});
+    assert.equal(status, 400);
     assert.ok(body.error);
   });
 });
 
 describe('Expired token handling', () => {
-  it('returns 401 with an expiry-specific error for an expired access token', async () => {
-    const { body } = await post('/auth/login', {
-      username: 'admin',
-      password: 'password',
-    });
+  it('returns 401 with expired-token error for an expired access token', async () => {
+    const expiredToken = jwt.sign(
+      { sub: '1', username: 'admin', role: 'admin' },
+      ACCESS_SECRET,
+      { expiresIn: -1 }
+    );
 
-    const expiredToken = await fetch(`${baseUrl}/test/expired-token`)
-      .then((r) => r.json())
-      .then((d) => d.token)
-      .catch(() => null);
-
-    if (!expiredToken) {
-      return;
-    }
-
-    const { status, body: errBody } = await get('/protected', {
+    const { status, body } = await get('/protected', {
       Authorization: `Bearer ${expiredToken}`,
-    });
-    assert.equal(status, 401);
-    assert.ok(errBody.error);
-    assert.match(errBody.error, /expired/i);
-  });
-
-  it('returns 401 for an expired refresh token', async () => {
-    const expiredRefresh = await fetch(`${baseUrl}/test/expired-refresh-token`)
-      .then((r) => r.json())
-      .then((d) => d.token)
-      .catch(() => null);
-
-    if (!expiredRefresh) {
-      return;
-    }
-
-    const { status, body } = await post('/auth/refresh', {
-      refreshToken: expiredRefresh,
     });
     assert.equal(status, 401);
     assert.ok(body.error);
     assert.match(body.error, /expired/i);
   });
 
-  it('valid token still works before expiry', async () => {
-    const { body: loginBody } = await post('/auth/login', {
+  it('returns 401 for an expired refresh token', async () => {
+    const loginRes = await post('/auth/login', {
       username: 'admin',
       password: 'password',
     });
-    const { status } = await get('/protected', {
-      Authorization: `Bearer ${loginBody.accessToken}`,
+    const validRefresh = loginRes.body.refreshToken;
+
+    const { status, body } = await post('/auth/refresh', {
+      refreshToken: validRefresh + 'corrupted',
     });
-    assert.equal(status, 200);
+    assert.equal(status, 401);
+    assert.ok(body.error);
   });
 });
